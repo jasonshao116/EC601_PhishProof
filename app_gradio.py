@@ -2,6 +2,7 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
 import gradio as gr
+import re
 
 MODEL_ID = "AcuteShrewdSecurity/Llama-Phishsense-1B"
 
@@ -37,11 +38,15 @@ def predict_single(email_text: str) -> str:
             do_sample=False
         )
     text = tokenizer.decode(out[0], skip_special_tokens=True)
-    # Be robust if the model doesn't echo exactly "Answer:"
-    ans = text.split("Answer:")[-1].strip().split()[0]
-    ans = ans.upper().strip(".:,;")
-    if ans not in {"TRUE", "FALSE"}:
-        ans = f"Uncertain (raw: {ans})"
+    raw = text.split("Answer:")[-1].strip()
+    # remove punctuation, hashes, and collapse spaces
+    cleaned = re.sub(r'[^A-Za-z ]', ' ', raw)
+    # extract the first TRUE or FALSE (case-insensitive)
+    match = re.search(r'\b(TRUE|FALSE)\b', cleaned, re.IGNORECASE)
+    if match:
+        ans = match.group(1).upper()
+    else:
+        ans = f"Uncertain (raw: {raw.strip()})"
     return ans
 
 with gr.Blocks(title="PhishSense 1B (LoRA) Demo") as demo:

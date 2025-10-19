@@ -2,6 +2,7 @@ import torch
 from flask import Flask, request, render_template_string
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
+import re
 
 MODEL_ID = "AcuteShrewdSecurity/Llama-Phishsense-1B"
 app = Flask(__name__)
@@ -51,9 +52,14 @@ def classify(email_text: str) -> str:
             do_sample=False
         )
     text = tokenizer.decode(out[0], skip_special_tokens=True)
-    ans = text.split("Answer:")[-1].strip().split()[0]
-    ans = ans.upper().strip(".:,;")
-    return ans if ans in {"TRUE", "FALSE"} else f"Uncertain (raw: {ans})"
+    # --- robust parsing: find the first TRUE/FALSE after "Answer:" ---
+    raw = text.split("Answer:")[-1].strip()
+    cleaned = re.sub(r'[^A-Za-z ]', ' ', raw)          # drop punctuation/# etc.
+    m = re.search(r'\b(TRUE|FALSE)\b', cleaned, re.I)  # pick the first valid label
+    if m:
+        return m.group(1).upper()
+    else:
+        return f"Uncertain (raw: {raw})"
 
 @app.get("/")
 def index():

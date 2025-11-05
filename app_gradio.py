@@ -1,64 +1,96 @@
+import os
+import re
 import torch
+import gradio as gr
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
-import gradio as gr
-import re
 
-MODEL_ID = "AcuteShrewdSecurity/Llama-Phishsense-1B"
+# -------------------- Device & dtype (MPS-safe) --------------------
+DEVICE = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
+DTYPE = torch.float16 if DEVICE == "mps" else (torch.bfloat16 if DEVICE == "cuda" else torch.float32)
 
+# -------------------- Configuration --------------------
+BASE_ID = os.environ.get("BASE_ID", "meta-llama/Llama-3.2-1B-Instruct")
+ADAPTER_PATH = os.environ.get("ADAPTER_PATH", "phishsense_lora_adapter")
+HF_TOKEN = os.environ.get("HF_TOKEN")
+MAX_LENGTH = int(os.environ.get("MAX_LENGTH", "1024"))
+PORT = int(os.environ.get("PORT", "7860"))
+SHARE = os.environ.get("SHARE", "false").lower() in {"1", "true", "yes"}
+
+# -------------------- Load model (no device_map='auto' for MPS) --------------------
 def load_model():
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    base_model = AutoModelForCausalLM.from_pretrained(MODEL_ID)
-    model = PeftModel.from_pretrained(base_model, MODEL_ID)
-    if torch.cuda.is_available():
-        model = model.to("cuda")
+    tokenizer = AutoTokenizer.from_pretrained(BASE_ID, token=HF_TOKEN, use_fast=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    base = AutoModelForCausalLM.from_pretrained(
+        BASE_ID,
+        token=HF_TOKEN,
+        dtype=DTYPE,   # torch_dtype deprecated; use dtype
+    )
+
+    model = PeftModel.from_pretrained(base, ADAPTER_PATH)
+    model.to(DEVICE)
     model.eval()
     return model, tokenizer
 
 model, tokenizer = load_model()
 
+# -------------------- Inference --------------------
+PROMPT_PREFIX = (
+    "Classify the following text as phishing or not. "
+    "Respond with 'TRUE' or 'FALSE' (exactly one word):\n\n"
+)
+
 def predict_single(email_text: str) -> str:
-    if not email_text.strip():
+    if not email_text or not email_text.strip():
         return "Please paste an email."
-    prompt = (
-        "Classify the following text as phishing or not. "
-        "Respond with 'TRUE' or 'FALSE':\n\n"
-        f"{email_text}\nAnswer:"
-    )
+
+    prompt = f"{PROMPT_PREFIX}{email_text}\nAnswer:"
     inputs = tokenizer(
-        prompt, return_tensors="pt", padding=True, truncation=True, max_length=2048
+        prompt,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=MAX_LENGTH,
     )
-    if torch.cuda.is_available():
-        inputs = {k: v.to("cuda") for k, v in inputs.items()}
+    # Ensure inputs are on the same device as the model (fixes MPS placeholder error)
+    inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+
     with torch.no_grad():
         out = model.generate(
             **inputs,
             max_new_tokens=5,
             temperature=0.01,
-            do_sample=False
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
         )
-    text = tokenizer.decode(out[0], skip_special_tokens=True)
-    raw = text.split("Answer:")[-1].strip()
-    # remove punctuation, hashes, and collapse spaces
-    cleaned = re.sub(r'[^A-Za-z ]', ' ', raw)
-    # extract the first TRUE or FALSE (case-insensitive)
-    match = re.search(r'\b(TRUE|FALSE)\b', cleaned, re.IGNORECASE)
-    if match:
-        ans = match.group(1).upper()
-    else:
-        ans = f"Uncertain (raw: {raw.strip()})"
-    return ans
 
-with gr.Blocks(title="PhishSense 1B (LoRA) Demo") as demo:
-    gr.Markdown("# 📧 PhishSense 1B — Phishing Classifier\nPaste an email and get `TRUE` (phishing) or `FALSE` (not phishing).")
+    text = tokenizer.decode(out[0], skip_special_tokens=True)
+
+    # Robust parsing to find first TRUE/FALSE after "Answer:"
+    raw = text.split("Answer:")[-1].strip()
+    cleaned = re.sub(r"[^A-Za-z ]", " ", raw)
+    m = re.search(r"\b(TRUE|FALSE)\b", cleaned, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    return f"Uncertain (raw: {raw})"
+
+# -------------------- UI --------------------
+with gr.Blocks(title="PhishSense — LoRA (Gradio, MPS-safe)") as demo:
+    gr.Markdown(
+        "# 📧 PhishProof — Phishing Classifier\n"
+        "Paste an email and get `TRUE` (phishing) or `FALSE` (not phishing)."
+    )
     with gr.Row():
         email = gr.Textbox(
             label="Email text",
-            lines=10,
+            lines=12,
             placeholder="Paste the email body here..."
         )
         result = gr.Label(label="Prediction")
-    examples = gr.Examples(
+
+    gr.Examples(
         examples=[
             ["Urgent: Your account has been flagged for suspicious activity. Please log in immediately."],
             ["Hi Jason, thanks for your help last week. Here are the meeting notes attached."],
@@ -66,9 +98,9 @@ with gr.Blocks(title="PhishSense 1B (LoRA) Demo") as demo:
         ],
         inputs=[email],
     )
+
     btn = gr.Button("Classify")
     btn.click(fn=predict_single, inputs=[email], outputs=[result])
 
 if __name__ == "__main__":
-    # Share=True lets you get a temporary public URL; remove if not needed
-    demo.queue().launch(server_name="0.0.0.0", server_port=7860, share=False)
+    demo.queue().launch(server_name="0.0.0.0", server_port=PORT, share=SHARE)

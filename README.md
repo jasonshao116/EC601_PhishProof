@@ -1,8 +1,34 @@
 # EC601_PhishProof
+
 This is the Repo for my EC601 Project - PhishProof. 
 
 app_flask.py and app_gardio.py are two web apps for demo purposes. They both use the fine-tuned PhishSense model (Llama-Phishsense-1B). 
 They use a prompt such as: "Classify the following text as phishing or not. Respond with 'TRUE' or 'FALSE': ...". 
+
+
+### **train_lora.py**
+
+What it does: 
+- Fine-tunes a base LLM with LoRA (PEFT) to perform binary phishing classification.
+- Reads a CSV (expects message_content and is_spam columns), builds prompts like: “Classify the following text as phishing or not… Answer: TRUE/FALSE”, then tokenizes and trains.
+- Supports optional 4-bit loading (bitsandbytes) and is friendly to Apple-silicon (MPS) setups.
+
+Model & Training Data: 
+- Loads any causal LLM via AutoModelForCausalLM.from_pretrained(args.base_model) with the matching AutoTokenizer. 
+- We use meta-llama/Llama-3.2-1B-Instruct (https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct) as the base model. 
+- spam_dataset.csv contains our training dataset. It includes 1,000 entries of spam and non-spam messages with realistic content. Source: https://www.kaggle.com/datasets/devildyno/email-spam-or-not-classification 
+
+Outputs:
+- Saves only the LoRA adapter + tokenizer to --output_dir (not the full merged model). 
+- We use this adapter-augmented model to run the TRUE/FALSE phishing classifier via generation.
+
+How to run it: 
+```bash
+pip install -U datasets
+python train_lora.py --csv_path Training_data/spam_dataset.csv --output_dir phishsense_lora_adapter --hf_token $HF_TOKEN --max_length 512 --batch_size 1 --eval_batch_size 1 --gradient_accumulation_steps 16 
+# Replace $HF_TOKEN with your Hugging Face Token to gain access to meta-llama/Llama-3.2-1B-Instruct model. 
+# This is just an example usage. The parameters after $HF_TOKEN can be changed to adjust speed, memory usage, and training quality.
+```
 
 
 ### **app_gradio.py — Quick interactive demo (no HTML required)**

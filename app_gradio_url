@@ -1,1 +1,406 @@
+# app_gradio.py
+
+import os
+import re
+import torch
+import gradio as gr
+
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import PeftModel
+
+# ---------------- CONFIG ----------------
+
+BASE_ID = "meta-llama/Llama-3.2-1B-Instruct"
+
+# HF token (already set as a secret / env variable in Colab)
+HF_TOKEN = os.getenv("HF_TOKEN", None)
+
+# LoRA adapters saved in your Drive
+LORA_EMAIL_PATH = "/content/drive/MyDrive/PhishProof/phishsense_lora_adapter_email"
+LORA_URL_PATH   = "/content/drive/MyDrive/PhishProof/phishsense_lora_adapter_url"
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Words we treat as suspicious in the heuristics/explanation
+SUSPICIOUS_WORDS = [
+    "verify", "verification", "confirm", "account", "urgent", "immediately",
+    "password", "reset", "click", "login", "log in", "update", "suspend",
+    "security alert", "identity", "billing", "invoice", "prize", "winner",
+    "limited time", "credit card", "credit card number", "bank account",
+    "wire transfer", "act now"
+]
+
+# ---------------- TOKENIZER + MODELS ----------------
+
+print("Loading tokenizer...")
+tokenizer = AutoTokenizer.from_pretrained(
+    BASE_ID,
+    token=HF_TOKEN,
+    use_fast=True,
+)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+
+def load_lora_model(lora_path: str):
+    """
+    Load base Llama + a specific LoRA adapter.
+    We keep separate base+LoRA for email and URL to avoid adapter switching.
+    """
+    print(f"Loading LoRA model from: {lora_path}")
+    print(f"Device: {device}")
+    base = AutoModelForCausalLM.from_pretrained(
+        BASE_ID,
+        token=HF_TOKEN,
+        torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
+        device_map="auto" if device == "cuda" else None,
+    )
+    model = PeftModel.from_pretrained(base, lora_path)
+    model.to(device)
+    model.eval()
+    return model
+
+
+print("Loading email LoRA model...")
+email_model = load_lora_model(LORA_EMAIL_PATH)
+
+print("Loading URL LoRA model...")
+url_model = load_lora_model(LORA_URL_PATH)
+
+
+# ---------------- UTILITIES ----------------
+
+def extract_urls(text: str):
+    """Very simple URL regex."""
+    url_pattern = r"(https?://[^\s]+)"
+    return re.findall(url_pattern, text)
+
+
+def score_suspicious_words(text: str):
+    """Return list of suspicious words found (for explanation & heuristics)."""
+    found = []
+    lower = text.lower()
+    for w in SUSPICIOUS_WORDS:
+        if w in lower:
+            found.append(w)
+    return sorted(set(found))
+
+
+def heuristic_rule_score(text: str, urls, found_words):
+    """
+    Simple rule-based score in [0, 1] to capture obvious phishing cases.
+    """
+    lower = text.lower()
+    score = 0.0
+
+    # Strong signals: asking for sensitive info
+    for w in ["credit card", "password", "bank account", "wire transfer", "social security"]:
+        if w in lower:
+            score += 0.4
+            break
+
+    # Urgency + account/verify style language
+    if any(w in lower for w in ["urgent", "immediately", "act now"]):
+        score += 0.2
+    if any(w in lower for w in ["verify", "verification", "confirm", "login", "log in", "account"]):
+        score += 0.2
+
+    # Risky URL patterns
+    if urls:
+        http_only = [u for u in urls if u.startswith("http://")]
+        if http_only:
+            score += 0.2
+        digit_heavy = [u for u in urls if re.search(r"\d{5,}", u)]
+        if digit_heavy:
+            score += 0.1
+
+    return max(0.0, min(1.0, score))
+
+
+def build_email_prompt(email_text: str, urls):
+    """
+    Prompt for the email LoRA.
+    We ask for SCORE (0–1) and LABEL (TRUE/FALSE).
+    """
+    url_section = "none"
+    if urls:
+        url_list = "\n".join(f"- {u}" for u in urls)
+        url_section = f"\n{url_list}"
+
+    prompt = f"""
+You are PhishProof, a phishing email classifier.
+
+TASK:
+Given the email body and any links, estimate how likely this email is phishing.
+
+GUIDELINES:
+- Phishing (TRUE) if it asks for passwords, credit cards, bank info, wire transfers,
+  or account verification.
+- Phishing if links go to unfamiliar or suspicious domains, or use "http://" instead of "https://".
+- Safe (FALSE) if it's a normal, friendly conversation with no request for sensitive info.
+
+EMAIL BODY:
+{email_text}
+
+LINKS:
+{url_section}
+
+Return your answer in EXACTLY this format:
+
+SCORE: x.xxx
+LABEL: TRUE or FALSE
+""".strip()
+
+    return prompt
+
+
+def build_url_prompt(urls):
+    """
+    Prompt for the URL LoRA.
+    Classifies phishing risk based only on URLs.
+    """
+    url_list = "\n".join(f"- {u}" for u in urls)
+    prompt = f"""
+You are PhishProof, a URL phishing classifier.
+
+TASK:
+Analyze the following URL(s) and estimate how likely they are to be used in a phishing attack.
+
+Consider:
+- Suspicious domains, IP-based URLs, long or random-looking paths, many digits,
+  or known URL shorteners.
+- Use of "http://" instead of "https://".
+- Misspelled brand names or strange subdomains.
+
+URLS:
+{url_list}
+
+Return your answer in EXACTLY this format:
+
+SCORE: x.xxx
+LABEL: TRUE or FALSE
+(where TRUE = phishing URL, FALSE = not phishing)
+""".strip()
+
+    return prompt
+
+
+@torch.no_grad()
+def run_lora(model, prompt: str):
+    """
+    Run a LoRA model with the given prompt and parse SCORE + LABEL.
+    Returns (score_float, label_bool, raw_response).
+    """
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=512,
+    ).to(device)
+
+    out_ids = model.generate(
+        **inputs,
+        max_new_tokens=48,
+        do_sample=False,
+    )
+
+    decoded = tokenizer.decode(out_ids[0], skip_special_tokens=True)
+
+    # Try to keep only the part after the prompt
+    if decoded.startswith(prompt):
+        response = decoded[len(prompt):].strip()
+    else:
+        response = decoded
+
+    # Parse SCORE
+    score_match = re.search(r"SCORE\s*:\s*([01](?:\.\d+)?)", response, re.IGNORECASE)
+    if score_match:
+        score = float(score_match.group(1))
+        score = max(0.0, min(1.0, score))
+    else:
+        # Fallback: rough score based on TRUE/FALSE presence
+        if "TRUE" in response.upper() and "FALSE" not in response.upper():
+            score = 0.8
+        elif "FALSE" in response.upper() and "TRUE" not in response.upper():
+            score = 0.2
+        else:
+            score = 0.5
+
+    # Parse LABEL
+    label_match = re.search(r"LABEL\s*:\s*(TRUE|FALSE)", response, re.IGNORECASE)
+    if label_match:
+        label_str = label_match.group(1).upper()
+        label_bool = (label_str == "TRUE")
+    else:
+        # If no explicit label, use score >= 0.5 as cutoff
+        label_bool = score >= 0.5
+
+    return score, label_bool, response.strip()
+
+
+def fuse_decision(email_score, url_score, rule_score):
+    """
+    Combine model scores + heuristics into a final risk and label.
+    Returns (final_label_bool, final_risk_float).
+    """
+    # Weighted combination of both LoRA scores
+    combined_model_risk = 0.6 * email_score + 0.4 * url_score
+
+    # Overall risk is the max of model risk and heuristic rule score
+    overall_risk = max(combined_model_risk, rule_score)
+
+    # Threshold: > 0.55 is phishing
+    final_label = overall_risk >= 0.55
+
+    return final_label, overall_risk
+
+
+def build_explanation(
+    email_text,
+    urls,
+    suspicious_words,
+    email_score,
+    email_label,
+    email_resp,
+    url_score,
+    url_label,
+    url_resp,
+    rule_score,
+    final_label,
+    final_risk,
+):
+    lines = []
+
+    # Suspicious words
+    if suspicious_words:
+        lines.append(
+            "Suspicious phrases in the email body: "
+            + ", ".join(sorted(set(suspicious_words)))
+        )
+
+    # URLs
+    if urls:
+        lines.append(
+            "The email contains the following link(s): "
+            + ", ".join(urls)
+        )
+        http_only = [u for u in urls if u.startswith("http://")]
+        if http_only:
+            lines.append(
+                "Some links use 'http://' instead of 'https://', "
+                "which is often less secure and can be a phishing signal."
+            )
+    else:
+        lines.append("No URLs were detected in this email.")
+
+    # Email model summary
+    lines.append(
+        f"Email-text model score: {email_score:.3f} "
+        f"→ predicted {'PHISHING (TRUE)' if email_label else 'NOT phishing (FALSE)'}."
+    )
+
+    # URL model summary (if any URLs)
+    if urls:
+        lines.append(
+            f"URL model score: {url_score:.3f} "
+            f"→ predicted {'PHISHING (TRUE)' if url_label else 'NOT phishing (FALSE)'}."
+        )
+    else:
+        lines.append("URL model was not used because no URLs were found.")
+
+    # Heuristic rule summary
+    lines.append(f"Heuristic rule-based risk score: {rule_score:.3f}.")
+
+    # Final decision
+    if final_label:
+        lines.append(
+            f"\nOverall decision: combined risk = {final_risk:.3f} "
+            "≥ 0.55, so this email is considered **PHISHING (TRUE)**."
+        )
+    else:
+        lines.append(
+            f"\nOverall decision: combined risk = {final_risk:.3f} "
+            "< 0.55, so this email is considered **LIKELY SAFE (FALSE)**."
+        )
+
+    return "\n\n".join(lines)
+
+
+# ---------------- MAIN CLASSIFICATION FUNCTION ----------------
+
+def classify_email(email_text: str):
+    if not email_text.strip():
+        return "FALSE (Likely safe)", "No email text provided.", []
+
+    urls = extract_urls(email_text)
+    suspicious_words = score_suspicious_words(email_text)
+
+    # Heuristic rule score
+    rule_score = heuristic_rule_score(email_text, urls, suspicious_words)
+
+    # Email LoRA
+    email_prompt = build_email_prompt(email_text, urls)
+    email_score, email_label, email_resp = run_lora(email_model, email_prompt)
+
+    # URL LoRA (only if URLs exist)
+    if urls:
+        url_prompt = build_url_prompt(urls)
+        url_score, url_label, url_resp = run_lora(url_model, url_prompt)
+    else:
+        url_score, url_label, url_resp = 0.2, False, "No URLs – default low risk."
+
+    # Fuse everything
+    final_label, final_risk = fuse_decision(email_score, url_score, rule_score)
+
+    # Explanation text
+    explanation = build_explanation(
+        email_text=email_text,
+        urls=urls,
+        suspicious_words=suspicious_words,
+        email_score=email_score,
+        email_label=email_label,
+        email_resp=email_resp,
+        url_score=url_score,
+        url_label=url_label,
+        url_resp=url_resp,
+        rule_score=rule_score,
+        final_label=final_label,
+        final_risk=final_risk,
+    )
+
+    label_str = "TRUE (Likely phishing)" if final_label else "FALSE (Likely safe)"
+    return label_str, explanation, urls
+
+
+# ---------------- GRADIO UI ----------------
+
+with gr.Blocks() as demo:
+    gr.Markdown("# PhishProof – Email + URL Phishing Detector")
+
+    with gr.Row():
+        with gr.Column():
+            email_input = gr.Textbox(
+                label="Paste email text (including any links)",
+                lines=12,
+                placeholder="Paste the full email body here, including any URLs..."
+            )
+            analyze_btn = gr.Button("Analyze email")
+        with gr.Column():
+            result_label = gr.Textbox(label="Phishing?", interactive=False)
+            explanation_box = gr.Textbox(
+                label="Why is this flagged?",
+                lines=14,
+            )
+            urls_box = gr.JSON(label="URLs detected in the email")
+
+    analyze_btn.click(
+        fn=classify_email,
+        inputs=[email_input],
+        outputs=[result_label, explanation_box, urls_box],
+    )
+
+
+if __name__ == "__main__":
+    # In Colab this will also print the public Gradio link
+    demo.launch(share=True)
 

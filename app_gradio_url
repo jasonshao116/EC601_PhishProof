@@ -244,13 +244,13 @@ def fuse_decision(email_score, url_score, rule_score):
     Returns (final_label_bool, final_risk_float).
     """
     # Weighted combination of both LoRA scores
-    combined_model_risk = 0.6 * email_score + 0.4 * url_score
+    combined_model_risk = 0.4 * email_score + 0.6 * url_score
 
     # Overall risk is the max of model risk and heuristic rule score
     overall_risk = max(combined_model_risk, rule_score)
 
     # Threshold: > 0.55 is phishing
-    final_label = overall_risk >= 0.55
+    final_label = overall_risk >= 0.50
 
     return final_label, overall_risk
 

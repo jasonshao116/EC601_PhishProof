@@ -8,7 +8,7 @@ import gradio as gr
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
 
-# ---------------- CONFIG ----------------
+# Configuration
 
 BASE_ID = "meta-llama/Llama-3.2-1B-Instruct"
 
@@ -30,7 +30,7 @@ SUSPICIOUS_WORDS = [
     "wire transfer", "act now"
 ]
 
-# ---------------- TOKENIZER + MODELS ----------------
+# Tokenizer and Models
 
 print("Loading tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(
@@ -68,7 +68,7 @@ print("Loading URL LoRA model...")
 url_model = load_lora_model(LORA_URL_PATH)
 
 
-# ---------------- UTILITIES ----------------
+# Utilities
 
 def extract_urls(text: str):
     """Very simple URL regex."""
@@ -326,7 +326,7 @@ def build_explanation(
     return "\n\n".join(lines)
 
 
-# ---------------- MAIN CLASSIFICATION FUNCTION ----------------
+# Main Classification Function
 
 def classify_email(email_text: str):
     if not email_text.strip():
@@ -372,7 +372,7 @@ def classify_email(email_text: str):
     return label_str, explanation, urls
 
 
-# ---------------- GRADIO UI ----------------
+# Gradio UI
 
 with gr.Blocks() as demo:
     gr.Markdown("# PhishProof – Email + URL Phishing Detector")
